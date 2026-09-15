@@ -1,362 +1,333 @@
 #!/usr/bin/env python3
-"""
-DualSense HD-haptics fix for Death Stranding 2 in the CrossOver "DS2" bottle.
+# SPDX-License-Identifier: MIT
+"""Install the verified DualSense haptics fix in a CrossOver DS2 bottle."""
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
 
-THE BUG
--------
-libScePad (statically linked into DS2.exe) finds the controller's USB-audio
-endpoint -- channels 3/4 of which drive the haptic actuators -- by reading
-DEVPKEY_Device_ContainerId {8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C},2 from the HID
-device and matching it against the same property on each audio endpoint.  Wine's
-mmdevapi never writes that property on endpoints, so the match never succeeds and
-the haptic stream is never opened.  Adaptive triggers are unaffected -- they ride
-the HID pipe.  (Verified in a wine log: queried 6342 times, ERROR_FILE_NOT_FOUND
-every time.)
-
-WHY A KEEPALIVE
----------------
-Wine's winebus builds the container ID in make_unique_container_id() with
-QueryPerformanceCounter() in the low 8 bytes, so it is regenerated every time the
-device object is created -- i.e. on every new wineserver.  If each `wine` command
-gets its own wineserver, the value we stamp is stale before the game reads it.
-So this script holds ONE wineserver open (via a parked cmd.exe started through
-CrossOver's own wrapper, which keeps msync registered) and does the read, the
-stamp and the launch inside it.
-
-USAGE
-    python3 ds2-fix-haptics.py              # stamp + launch, one wineserver
-    python3 ds2-fix-haptics.py --hold       # stamp, then hold the server open so
-                                            #   you can launch the game yourself
-                                            #   (CrossOver GUI or any way you like)
-    python3 ds2-fix-haptics.py --binary     # stamp ContainerId as REG_BINARY
-    python3 ds2-fix-haptics.py --debug LOG  # stamp + launch with a wine debug log
-    python3 ds2-fix-haptics.py --probe      # re-test which wine invocation works
-    python3 ds2-fix-haptics.py --kill-orphans   # clear stray wineservers first
-"""
-import argparse, os, pathlib, re, signal, subprocess, sys, time
-
-CX      = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
-WINE    = f"{CX}/bin/wine"
-BOTTLE  = "DS2"
-BOTTLES = "/Volumes/WD/Crossover"
-PREFIX  = f"{BOTTLES}/{BOTTLE}"
-DRIVE_C = f"{PREFIX}/drive_c"
-GAME    = r"C:\Program Files\DEATH STRANDING 2 ON THE BEACH\DS2.exe"
-
-HID_KEY   = r"HKEY_LOCAL_MACHINE\System\CurrentControlSet\Enum\HID"
-AUDIO_KEY = r"HKEY_CURRENT_USER\Software\Wine\Drivers\winecoreaudio.drv\devices"
-MMDEV     = r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\MMDevices\Audio"
-CONTAINER_ID = "{8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C},2"
-PHYS_SPK     = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},3"
-PAD_RE = re.compile(r'DualSense Wireless Controller:([0-9A-Fa-f]+):(\d+)')
+STOCK_SHA = 'ef72fbb20bad5527ccf978d5fc6d451a4a529a574385ff50ad56d7301ccb05da'
+PATCH_SHA = 'abb0a074db3a7025c6373eca399748a888ec209cb020c11b807defaaf9e20e22'
+VALUE = '{8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c},2'
+MMDEV = r'HKLM\Software\Microsoft\Windows\CurrentVersion\MMDevices\Audio'
+GUID = r'\{[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}'
+EMBEDDED = {}  # Release builder inserts compressed, checksummed open-source binaries.
 
 
-def base_env(extra=None):
-    e = dict(os.environ)
-    e["CX_BOTTLE_PATH"] = BOTTLES
-    e.setdefault("ROSETTA_ADVERTISE_AVX", "1")   # DS2 crashes without it
-    for junk in ("CX_DEBUGMSG", "WINEDEBUG", "CX_LOG", "CX_INITIALIZED",
-                 "WINEPREFIX", "CX_BOTTLE"):
-        e.pop(junk, None)
-    if extra: e.update(extra)
-    return e
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def wine(args, extra_env=None, capture=True):
-    return subprocess.run([WINE, "--bottle", BOTTLE, *args], env=base_env(extra_env),
-                          capture_output=capture, text=True, errors="replace")
-
-
-# ---------------------------------------------------------------- wineserver --
-def find_wineservers():
+def atomic_copy(source, target):
+    fd, name = tempfile.mkstemp(prefix='.ds2-haptics-', dir=target.parent)
+    os.close(fd)
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
-                             text=True, errors="replace").stdout
-    except OSError:
-        return []
-    hits = []
-    for line in out.splitlines():
-        line = line.strip()
-        if "wineserver" in line and "grep" not in line:
-            pid, _, cmd = line.partition(" ")
-            if pid.isdigit(): hits.append((int(pid), cmd.strip()))
-    return hits
-
-
-def kill_wineservers():
-    procs = find_wineservers()
-    if not procs:
-        print("no wineserver processes running."); return
-    print(f"killing {len(procs)} wineserver process(es)")
-    for pid, _ in procs:
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try: os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError): break
-            time.sleep(1.0)
-            if not any(p == pid for p, _ in find_wineservers()): break
-    print("   remaining:", len(find_wineservers()))
-
-
-def start_keepalive():
-    """Park a Windows process so ONE wineserver (with msync registered) stays up."""
-    p = subprocess.Popen([WINE, "--bottle", BOTTLE, "cmd"], env=base_env(),
-                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-    time.sleep(4.0)
-    if p.poll() is None:
-        return p, "cmd.exe"
-    p = subprocess.Popen([WINE, "--bottle", BOTTLE, "ping", "-n", "3600", "127.0.0.1"],
-                         env=base_env(), stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(3.0)
-    return (p, "ping.exe") if p.poll() is None else (None, None)
-
-
-def stop_keepalive(proc):
-    if not proc or proc.poll() is not None: return
-    try:
-        if proc.stdin: proc.stdin.close()
-    except OSError: pass
-    try:
-        proc.terminate(); proc.wait(timeout=5)
-    except Exception:
-        try: proc.kill()
-        except Exception: pass
-
-
-# ------------------------------------------------------------------ registry --
-def export_key(key, which):
-    host = pathlib.Path(f"{DRIVE_C}/ds2fix_{which}.reg")
-    win = rf"C:\ds2fix_{which}.reg"
-    if host.exists():
-        try: host.unlink()
-        except OSError: pass
-    wine(["reg", "export", key, win, "/y"])
-    time.sleep(0.6)
-    if not host.exists(): return ""
-    data = host.read_bytes()
-    for enc in ("utf-16", "utf-8-sig", "utf-8", "latin-1"):
-        try:
-            t = data.decode(enc)
-            if "[HKEY" in t: return t
-        except UnicodeError: continue
-    return ""
-
-
-def parse_reg(text):
-    text = re.sub(r'\\\r?\n\s*', '', text)
-    out, key = {}, None
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("["):
-            key = s[1:s.rindex("]")] if "]" in s else s[1:]
-            out.setdefault(key, {})
-        elif key and s.startswith('"'):
-            m = re.match(r'"((?:[^"\\]|\\.)*)"=(.*)', s)
-            if m: out[key][m.group(1)] = m.group(2)
-    return out
-
-
-def guid_from_hex(h):
-    b = bytes(int(x, 16) for x in re.findall(r'[0-9A-Fa-f]{2}', h))
-    if len(b) != 16: return None
-    rest = b[8:].hex().upper()
-    return "{%08X-%04X-%04X-%s-%s}" % (int.from_bytes(b[0:4], "little"),
-                                       int.from_bytes(b[4:6], "little"),
-                                       int.from_bytes(b[6:8], "little"),
-                                       rest[:4], rest[4:])
-
-
-def read_pad_containers():
-    text = export_key(HID_KEY, "hid")
-    out, total = {}, 0
-    for key, vals in parse_reg(text).items():
-        total += 1
-        if "VID_054C" not in key.upper(): continue
-        cid = vals.get("ContainerId", "").strip('"')
-        leaf = key.split("\\")[-1]; parts = leaf.split("&")
-        if not cid or len(parts) <= 3: continue
-        loc, primary = parts[2].lower(), leaf.endswith("&0&0")
-        if loc not in out or (primary and not out[loc][1]):
-            out[loc] = (cid, primary)
-    return {k: v[0] for k, v in out.items()}, total
-
-
-def read_endpoints():
-    eps = []
-    for key, vals in parse_reg(export_key(AUDIO_KEY, "audio")).items():
-        if "devices\\" not in key: continue
-        dev = key.split("devices\\", 1)[1]
-        m, raw = PAD_RE.search(dev), vals.get("guid", "")
-        if m and raw.startswith("hex:"):
-            g = guid_from_hex(raw[4:])
-            if g: eps.append((m.group(1).lower(),
-                              "Render" if dev.split(",", 1)[0] == "0" else "Capture", g))
-    return eps
-
-
-def stamp(eps, pads, binary):
-    n = 0
-    for loc, flow, guid in sorted(eps):
-        cid = pads.get(loc)
-        if not cid:
-            print(f"   -  {flow:7s} {guid} (loc {loc}) - no live HID node, skipped"); continue
-        key = f"{MMDEV}\\{flow}\\{guid}\\Properties"
-        if binary:
-            b = bytes.fromhex(cid.strip("{}").replace("-", ""))
-            raw = (b[3::-1] + b[5:3:-1] + b[7:5:-1] + b[8:]).hex()
-            wine(["reg", "add", key, "/v", CONTAINER_ID, "/t", "REG_BINARY", "/d", raw, "/f"])
-        else:
-            wine(["reg", "add", key, "/v", CONTAINER_ID, "/t", "REG_SZ", "/d", cid, "/f"])
-        if flow == "Render":
-            wine(["reg", "add", key, "/v", PHYS_SPK, "/t", "REG_DWORD", "/d", "51", "/f"])
-        print(f"   +  {flow:7s} {guid} (loc {loc}) <- {cid}")
-        n += 1
-    return n
-
-
-def guid_bytes(cid):
-    """'{0CE6054C-0000-FFFF-08A0-6C92E8010000}' -> the 16 raw bytes Windows stores."""
-    h = cid.strip("{}").replace("-", "")
-    b = bytes.fromhex(h)
-    return b[3::-1] + b[5:3:-1] + b[7:5:-1] + b[8:]
-
-
-def stamp_rawguid(eps, pads):
-    """Write ContainerId as a REG_SZ whose FIRST 16 BYTES are the raw GUID.
-
-    The game reads PROPVARIANT.puuid without checking .vt.  Wine can only return
-    VT_LPWSTR for a REG_SZ, so the game dereferences pwszVal and reads 16 bytes
-    from the string buffer.  If those bytes *are* the GUID, the blind read yields
-    the right answer.  hex(1): lets us store a REG_SZ containing NUL bytes, which
-    'reg add /t REG_SZ' cannot express.
-    """
-    lines = ["Windows Registry Editor Version 5.00", ""]
-    n = 0
-    for loc, flow, guid in sorted(eps):
-        cid = pads.get(loc)
-        if not cid:
-            print(f"   -  {flow:7s} {guid} (loc {loc}) - no live HID node, skipped"); continue
-        raw = guid_bytes(cid) + b"\x00\x00"          # + UTF-16 NUL terminator
-        csv = ",".join(f"{x:02x}" for x in raw)
-        lines.append(f"[{MMDEV}\\{flow}\\{guid}\\Properties]")
-        lines.append(f'"{CONTAINER_ID}"=hex(1):{csv}')
-        if flow == "Render":
-            lines.append(f'"{PHYS_SPK}"=dword:00000033')
-        lines.append("")
-        print(f"   +  {flow:7s} {guid} (loc {loc}) <- raw bytes of {cid}")
-        n += 1
-    if not n:
-        return 0
-    host = pathlib.Path(f"{DRIVE_C}/ds2fix_guid.reg")
-    host.write_bytes(b"\xff\xfe" + "\r\n".join(lines).encode("utf-16-le"))
-    r = wine(["reg", "import", r"C:\ds2fix_guid.reg"])
-    if r.returncode != 0:
-        print("   !! reg import failed:", (r.stdout or "") + (r.stderr or ""))
-        return 0
-    return n
-
-
-def revert(eps):
-    """Remove the ContainerId property we added, restoring stock behaviour."""
-    n = 0
-    for loc, flow, guid in sorted(eps):
-        key = f"{MMDEV}\\{flow}\\{guid}\\Properties"
-        wine(["reg", "delete", key, "/v", CONTAINER_ID, "/f"])
-        print(f"   -  removed ContainerId from {flow:7s} {guid} (loc {loc})")
-        n += 1
-    return n
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--hold", action="store_true",
-                    help="stamp, then keep the wineserver open and let you launch the game")
-    ap.add_argument("--binary", action="store_true",
-                    help="write ContainerId as REG_BINARY - KNOWN TO CRASH THE GAME, diagnostic only")
-    ap.add_argument("--rawguid", action="store_true",
-                    help="write ContainerId as a REG_SZ whose bytes ARE the GUID "
-                         "(works around Wine being unable to return VT_CLSID)")
-    ap.add_argument("--revert", action="store_true",
-                    help="remove the ContainerId property entirely and exit")
-    ap.add_argument("--debug", metavar="LOGFILE", default=None)
-    ap.add_argument("--kill-orphans", action="store_true")
-    ap.add_argument("--probe", action="store_true")
-    args = ap.parse_args()
-
-    if not os.path.isdir(PREFIX): sys.exit(f"!! bottle not found at {PREFIX}")
-    if args.kill_orphans:
-        kill_wineservers(); time.sleep(2.0); print()
-
-    t0 = time.time()
-    print("holding one wineserver open ...")
-    keeper, how = start_keepalive()
-    if not keeper:
-        sys.exit("!! could not park a process to hold wineserver open.")
-    print(f"   parked {how}  (pid {keeper.pid})")
-
-    try:
-        pads, total = read_pad_containers()
-        eps = read_endpoints()
-        print(f"\nHID nodes: {total}   DualSense nodes: {len(pads)}   audio endpoints: {len(eps)}")
-        for loc, cid in sorted(pads.items()):
-            print(f"   usb location {loc:8s} -> {cid}")
-        if not pads: sys.exit("!! no DualSense HID node - pad connected by USB?")
-        if not eps:  sys.exit("!! no DualSense audio endpoint registered in this bottle.")
-
-        # prove the IDs are stable inside this server before relying on them
-        time.sleep(2.0)
-        again, _ = read_pad_containers()
-        drift = sorted(l for l in pads if again.get(l) != pads[l])
-        if drift:
-            print(f"\n!! container IDs still drifting (locations {drift}) even with the")
-            print("   wineserver held open. The keepalive is not holding the device object;")
-            print("   this approach cannot work - tell me and we patch mmdevapi instead.")
-            return
-        print("   container IDs stable across two reads - good.")
-
-        if args.revert:
-            print("\nremoving the ContainerId property from the DualSense endpoints ...")
-            revert(eps)
-            print("   done - the bottle is back to stock behaviour.")
-            return
-
-        if args.binary:
-            print("\n!! --binary is diagnostic only: it makes the game read a VT_BLOB where it\n"
-                  "   expects a GUID pointer, which crashes it. Continuing because you asked.")
-        if args.rawguid:
-            print("\nstamping ContainerId as raw GUID bytes inside a REG_SZ ...")
-            if not stamp_rawguid(eps, pads): sys.exit("!! nothing stamped.")
-        else:
-            print("\nstamping ContainerId onto the matching audio endpoints ...")
-            if not stamp(eps, pads, args.binary): sys.exit("!! nothing stamped.")
-
-        final, _ = read_pad_containers()
-        if any(final.get(l) != pads[l] for l in pads):
-            print("!! IDs changed after stamping - aborting rather than launching stale.")
-            return
-        print(f"   verified current.  ({time.time()-t0:.0f}s elapsed)")
-
-        if args.hold:
-            print("\nwineserver is held open and the endpoints are stamped.")
-            print("Launch Death Stranding 2 now, any way you like (CrossOver app is fine).")
-            print("Leave this terminal running while you play; press Ctrl-C when done.")
-            try:
-                while keeper.poll() is None: time.sleep(5)
-            except KeyboardInterrupt:
-                print("\nreleasing.")
-            return
-
-        print("\nlaunching the game in this same wineserver ...")
-        argv, extra = ["--bottle", BOTTLE], None
-        if args.debug:
-            extra = {"CX_DEBUGMSG": "+mmdevapi,+coreaudio,+setupapi"}
-            argv += ["--cx-log", args.debug]
-        argv.append(GAME)
-        subprocess.run([WINE, *argv], env=base_env(extra))
+        shutil.copyfile(source, name)
+        os.replace(name, target)
     finally:
-        stop_keepalive(keeper)
+        if os.path.exists(name):
+            os.unlink(name)
 
 
-if __name__ == "__main__":
-    main()
+def winpath(path):
+    return 'Z:' + str(Path(path).resolve()).replace('/', '\\')
+
+
+def parse_probe(text):
+    ids = re.findall(r'^SONY_ID=(' + GUID + r')\s*$', text, re.M)
+    endpoints = []
+    for flow, endpoint, vt, cid in re.findall(
+            r'^ENDPOINT=(Render|Capture)\|([^|\r\n]+)\|(\d+)\|([^\r\n]*)', text, re.M):
+        guids = re.findall(GUID, endpoint)
+        if not guids:
+            raise RuntimeError('Malformed audio endpoint identifier')
+        endpoints.append((flow, guids[-1].upper(), int(vt), cid.strip().upper()))
+    if len([e for e in endpoints if e[0] == 'Render']) != 1:
+        raise RuntimeError('Connect exactly one USB DualSense with a four-channel audio endpoint.')
+    if len(endpoints) > 2 or len(set((e[0], e[1]) for e in endpoints)) != len(endpoints):
+        raise RuntimeError('Ambiguous controller endpoints; disconnect other controllers.')
+    return ids, endpoints
+
+
+def select_path(candidates, label, option):
+    paths = sorted(set(p.resolve() for p in candidates if p.exists()))
+    if len(paths) != 1:
+        listing = '\n'.join('  ' + str(p) for p in paths) or '  none found'
+        raise RuntimeError(f'Specify {option}; {label} candidates:\n{listing}')
+    return paths[0]
+
+
+def discover_bottle(explicit):
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if not (p / 'cxbottle.conf').is_file():
+            raise RuntimeError(f'Not a CrossOver bottle: {p}')
+        return p
+    root = Path.home() / 'Library/Application Support/CrossOver/Bottles'
+    candidates = [p for p in root.glob('*') if (p / 'drive_c').is_dir() and
+                  list((p / 'drive_c').glob('Program Files*/**/DS2.exe'))]
+    return select_path(candidates, 'DS2 bottle', '--bottle /path/to/bottle')
+
+
+def assets():
+    if EMBEDDED:
+        root = Path.home() / 'Library/Caches/DS2-Dualsense-Haptics-Wine' / PATCH_SHA[:12]
+        root.mkdir(parents=True, exist_ok=True)
+        for name, item in EMBEDDED.items():
+            data = zlib.decompress(base64.b64decode(item['data']))
+            if hashlib.sha256(data).hexdigest() != item['sha256']:
+                raise RuntimeError(f'Corrupt embedded asset: {name}')
+            path = root / name
+            if not path.exists() or sha(path) != item['sha256']:
+                fd, tmp = tempfile.mkstemp(dir=root)
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(data)
+                os.replace(tmp, path)
+        return root
+    root = Path(__file__).resolve().parents[1] / 'dist/assets'
+    if not (root / 'controller-probe.exe').exists():
+        raise RuntimeError('Download the standalone script from GitHub Releases, or build the release assets first.')
+    return root
+
+
+class Fix:
+    def __init__(self, bottle, crossover, state):
+        self.bottle, self.cx, self.state = bottle, crossover, state
+        self.dll = bottle / 'drive_c/windows/system32/mmdevapi.dll'
+        self.env = dict(os.environ)
+        for key in ('CX_INITIALIZED', 'CX_BOTTLE', 'WINEPREFIX', 'CX_LOG',
+                    'WINEDLLOVERRIDES', 'CX_DLL_OVERRIDES', 'CX_ENV', 'WINEDEBUG',
+                    'WINELOADER', 'WINEDLLPATH', 'DYLD_INSERT_LIBRARIES'):
+            self.env.pop(key, None)
+        self.env.update(CX_BOTTLE_PATH=str(bottle.parent), CX_DEBUGMSG='-all', ROSETTA_ADVERTISE_AVX='1')
+        self.cmd = [str(crossover / 'bin/wine'), '--bottle', bottle.name]
+        self.keeper = None
+        self.log = None
+        self.data = None
+
+    def run(self, args, check=True, timeout=45, native=True):
+        # Use files: Wine services can inherit pipes and keep communicate() waiting.
+        with tempfile.TemporaryFile(mode='w+') as out:
+            r = subprocess.run(self.cmd + (['--dll', 'mmdevapi=n'] if native else []) + args,
+                               env=self.env, stdout=out, stderr=subprocess.STDOUT, timeout=timeout)
+            out.seek(0)
+            text = out.read()
+        if self.log:
+            self.log.write(text); self.log.flush()
+        if check and r.returncode:
+            raise RuntimeError(f'Windows command failed ({r.returncode}):\n{text[-2500:]}')
+        return r.returncode, text
+
+    def save(self):
+        path = self.state / 'state.json'
+        tmp = self.state / 'state.tmp'
+        tmp.write_text(json.dumps(self.data, indent=2) + '\n')
+        os.replace(tmp, path)
+
+    def verify_installed(self, runtime, asset_dir):
+        self.data = json.loads((self.state / 'state.json').read_text())
+        if self.data.get('mode') != 'installed' or sha(self.dll) != PATCH_SHA:
+            raise RuntimeError('Incomplete or changed installation. Use --uninstall to recover first.')
+        self.start()
+        _, output = self.run([str(asset_dir / 'controller-probe.exe'), winpath(runtime)])
+        ids, endpoints = parse_probe(output)
+        expected = self.data['sony_id']
+        if ids != [expected] or any(vt != 72 or cid != expected for _,_,vt,cid in endpoints):
+            raise RuntimeError('Controller identity or endpoints changed. Uninstall, then install again with the controller connected.')
+        code, value = self.run(['reg','query',self.data['override_key'],'/v','mmdevapi'], check=False, native=False)
+        if code or not re.search(r'REG_SZ\s+native,builtin', value):
+            raise RuntimeError('The DS2 DLL override changed. See the saved installation state before repairing.')
+        print('The permanent fix is installed and verified. Launch DS2 normally.', flush=True)
+
+    def restore(self):
+        path = self.state / 'state.json'
+        if not path.exists():
+            print('No pending changes to restore.', flush=True)
+            return
+        self.data = json.loads(path.read_text())
+        if self.data['bottle'] != str(self.bottle):
+            raise RuntimeError('Recovery state belongs to a different bottle.')
+        backup = self.state / 'mmdevapi.original.dll'
+        if sha(backup) != self.data['original_sha256']:
+            raise RuntimeError('Recovery backup checksum mismatch; leaving state intact.')
+        if sha(self.dll) not in (self.data['original_sha256'], PATCH_SHA):
+            raise RuntimeError('The bottle DLL changed outside this script; leaving recovery state intact.')
+        override = self.data.get('override_key')
+        if override:
+            code, text = self.run(['reg','query',override,'/v','mmdevapi'], check=False, native=False)
+            if code == 0:
+                if not re.search(r'REG_SZ\s+native,builtin', text):
+                    raise RuntimeError('DS2 override changed outside this script; recovery state retained.')
+                self.run(['reg','delete',override,'/v','mmdevapi','/f'], native=False)
+        for key in self.data['keys']:
+            code, _ = self.run(['reg', 'query', key, '/v', VALUE], check=False, native=False)
+            if code == 0:
+                self.run(['reg', 'delete', key, '/v', VALUE, '/f'], native=False)
+            code, _ = self.run(['reg', 'query', key, '/v', VALUE], check=False, native=False)
+            if code == 0:
+                raise RuntimeError('Could not remove temporary endpoint property.')
+        atomic_copy(backup, self.dll)
+        if sha(self.dll) != self.data['original_sha256']:
+            raise RuntimeError('DLL restoration did not verify.')
+        path.unlink()
+        print('Restored the original DLL and removed temporary endpoint properties.', flush=True)
+
+    def start(self):
+        try:
+            self.run(['--wait-all'], timeout=20, native=False)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('Close the game and all Windows programs in this bottle, then retry.')
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.log = (self.state / 'latest.log').open('w')
+        self.keeper = subprocess.Popen(self.cmd + ['cmd'], env=self.env,
+                                       stdin=subprocess.PIPE, stdout=self.log, stderr=subprocess.STDOUT)
+        time.sleep(4)
+        if self.keeper.poll() is not None:
+            raise RuntimeError('Could not keep the Wine session open.')
+
+    def stop(self):
+        if self.keeper and self.keeper.poll() is None:
+            self.keeper.stdin.close()
+            try:
+                self.keeper.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.keeper.terminate()
+                self.keeper.wait(timeout=10)
+        if self.log:
+            self.log.close()
+
+    def launch(self, runtime, game, asset_dir, check_only, permanent=False):
+        if sha(self.cx / 'lib/wine/x86_64-windows/mmdevapi.dll') != STOCK_SHA:
+            raise RuntimeError('Unsupported CrossOver DLL. This release is tested with CrossOver 26.3.0.39832 only.')
+        if (self.state / 'state.json').exists() and permanent:
+            self.verify_installed(runtime, asset_dir)
+            return
+        if sha(self.dll) != STOCK_SHA:
+            raise RuntimeError('The bottle already has a modified mmdevapi.dll. Restore it before using this fix.')
+        if sha(asset_dir / 'mmdevapi.dll') != PATCH_SHA:
+            raise RuntimeError('Patched DLL checksum mismatch.')
+        if (self.state / 'state.json').exists():
+            raise RuntimeError('Previous session needs recovery. Run this script with --restore first.')
+        self.start()
+        # Backup and journal before the first mutation; finally also handles failed probes.
+        atomic_copy(self.dll, self.state / 'mmdevapi.original.dll')
+        self.data = {'bottle': str(self.bottle), 'original_sha256': sha(self.dll), 'keys': []}
+        self.save()
+        restore_needed = True
+        try:
+            atomic_copy(asset_dir / 'mmdevapi.dll', self.dll)
+            _, output = self.run([str(asset_dir / 'controller-probe.exe'), winpath(runtime)])
+            ids, endpoints = parse_probe(output)
+            if len(ids) != 1:
+                raise RuntimeError('Sony did not return exactly one valid controller identity.')
+            cid = ids[0].upper()
+            # Verify all baseline values first so unexpected existing values are preserved.
+            for flow, guid, vt, _ in endpoints:
+                key = f'{MMDEV}\\{flow}\\{guid}\\Properties'
+                code, _ = self.run(['reg', 'query', key, '/v', VALUE], check=False)
+                if code == 0 or vt != 0:
+                    raise RuntimeError('An endpoint already has a ContainerId. No endpoint properties were overwritten.')
+            for flow, guid, _, _ in endpoints:
+                key = f'{MMDEV}\\{flow}\\{guid}\\Properties'
+                self.data['keys'].append(key); self.save()
+                self.run(['reg', 'add', key, '/v', VALUE, '/t', 'REG_SZ', '/d', cid, '/f'])
+            _, verified = self.run([str(asset_dir / 'controller-probe.exe'), '-'])
+            _, actual = parse_probe(verified)
+            if {(f,g) for f,g,_,_ in actual} != {(f,g) for f,g,_,_ in endpoints} or any(
+                    vt != 72 or value != cid for _,_,vt,value in actual):
+                raise RuntimeError('Audio endpoint identity/type verification failed.')
+            if self.keeper.poll() is not None:
+                raise RuntimeError('Wine session ended during preparation.')
+            print(f'Verified Sony identity {cid} on {len(actual)} audio endpoint(s).', flush=True)
+            if check_only:
+                print('Preflight passed. Restoring now; no game launched.', flush=True)
+                return
+            if permanent:
+                key = r'HKCU\Software\Wine\AppDefaults\DS2.exe\DllOverrides'
+                code, _ = self.run(['reg','query',key,'/v','mmdevapi'], check=False, native=False)
+                if code == 0:
+                    raise RuntimeError('DS2 already has a mmdevapi override; it was not overwritten.')
+                self.data['override_key'] = key
+                self.data['sony_id'] = cid
+                self.save()
+                self.run(['reg','add',key,'/v','mmdevapi','/t','REG_SZ','/d','native,builtin','/f'], native=False)
+                code, value = self.run(['reg','query',key,'/v','mmdevapi'], native=False)
+                if not re.search(r'REG_SZ\s+native,builtin', value):
+                    raise RuntimeError('DS2 override did not verify.')
+                self.data['mode'] = 'installed'; self.save()
+                restore_needed = False
+                print('Installed permanently for DS2.exe in this bottle. Launch DS2 normally.', flush=True)
+                print('To undo: run this script with the same --bottle and --uninstall.', flush=True)
+                return
+            print('Launching DS2 with haptics. Keep this terminal open until the game exits.', flush=True)
+            # Do not restore a DLL under a running game on Ctrl-C. Wait for normal exit.
+            game_proc = subprocess.Popen(self.cmd + ['--dll','mmdevapi=n', winpath(game)],
+                                         env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
+            while True:
+                try:
+                    code = game_proc.wait()
+                    break
+                except KeyboardInterrupt:
+                    print('Quit DS2 normally so the script can restore the bottle.', flush=True)
+            print(f'DS2 exited with code {code}.', flush=True)
+            if code:
+                raise RuntimeError(f'DS2 launch failed. See {self.state / "latest.log"}')
+        finally:
+            if restore_needed:
+                self.restore()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--bottle', help='Full path to a CrossOver bottle (auto-detects standard DS2 installations)')
+    ap.add_argument('--game', type=Path, help='Full macOS path to DS2.exe, including an external Steam library')
+    ap.add_argument('--runtime', type=Path, help='Full macOS path to the installed libScePad.dll')
+    ap.add_argument('--crossover', type=Path, default=Path('/Applications/CrossOver.app'))
+    ap.add_argument('--session', action='store_true', help='Apply temporarily, launch DS2, and restore after exit')
+    ap.add_argument('--check', action='store_true', help='Verify the fix and restore it without launching the game')
+    ap.add_argument('--uninstall', '--restore', dest='restore', action='store_true', help='Remove the permanent fix or recover an interrupted session')
+    args = ap.parse_args(argv)
+    if sys.platform != 'darwin':
+        raise RuntimeError('This release supports macOS CrossOver only.')
+    bottle = discover_bottle(args.bottle)
+    cx = args.crossover.expanduser().resolve() / 'Contents/SharedSupport/CrossOver'
+    if not (cx / 'bin/wine').is_file():
+        raise RuntimeError('CrossOver was not found. Use --crossover /path/to/CrossOver.app')
+    state = bottle / '.ds2-haptics'
+    state.mkdir(exist_ok=True)
+    with (state / 'lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another fix session is already using this bottle.')
+        fix = Fix(bottle, cx, state)
+        try:
+            if args.restore:
+                fix.start(); fix.restore(); return
+            runtime = select_path([args.runtime.expanduser()] if args.runtime else
+                                  list((bottle / 'drive_c/ProgramData').glob('Sony Interactive Entertainment Inc/PSPC_SDK/**/libScePad.dll')),
+                                  'Sony runtime', '--runtime /path/to/libScePad.dll')
+            game = select_path([args.game.expanduser()] if args.game else
+                               list((bottle / 'drive_c').glob('Program Files*/**/DS2.exe')),
+                               'game executable', '--game /path/to/DS2.exe')
+            fix.launch(runtime, game, assets(), args.check, permanent=not args.session)
+        finally:
+            fix.stop()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (RuntimeError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(1)

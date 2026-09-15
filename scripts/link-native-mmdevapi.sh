@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Run from the configured Wine build directory.
+set -eu
+tools/winegcc/winegcc -o dlls/mmdevapi/x86_64-windows/mmdevapi.dll --wine-objdir . -b x86_64-w64-mingw32 -shared ../sources/wine/dlls/mmdevapi/mmdevapi.spec dlls/mmdevapi/x86_64-windows/audiosessionmanager.o dlls/mmdevapi/x86_64-windows/audiovolume.o dlls/mmdevapi/x86_64-windows/client.o dlls/mmdevapi/x86_64-windows/devenum.o dlls/mmdevapi/x86_64-windows/main.o dlls/mmdevapi/x86_64-windows/session.o dlls/mmdevapi/x86_64-windows/spatialaudio.o dlls/mmdevapi/x86_64-windows/mmdevapi_classes_r.res dlls/ole32/x86_64-windows/libole32.a dlls/oleaut32/x86_64-windows/liboleaut32.a dlls/user32/x86_64-windows/libuser32.a dlls/advapi32/x86_64-windows/libadvapi32.a dlls/version/x86_64-windows/libversion.a dlls/winmm/x86_64-windows/libwinmm.delay.a dlls/winecrt0/x86_64-windows/libwinecrt0.a dlls/ucrtbase/x86_64-windows/libucrtbase.a dlls/kernel32/x86_64-windows/libkernel32.a dlls/ntdll/x86_64-windows/libntdll.a
