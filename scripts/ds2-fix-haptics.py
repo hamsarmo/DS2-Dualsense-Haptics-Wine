@@ -96,7 +96,7 @@ def assets():
         return root
     root = Path(__file__).resolve().parents[1] / 'dist/assets'
     if not (root / 'controller-probe.exe').exists():
-        raise RuntimeError('Download the standalone script from GitHub Releases, or build the release assets first.')
+        raise RuntimeError('Download the standalone script from the repository release/ folder, or build the release assets first.')
     return root
 
 

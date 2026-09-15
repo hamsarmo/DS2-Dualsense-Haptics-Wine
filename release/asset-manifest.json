@@ -1,0 +1,14 @@
+{
+  "mmdevapi.dll": {
+    "sha256": "abb0a074db3a7025c6373eca399748a888ec209cb020c11b807defaaf9e20e22"
+  },
+  "controller-probe.exe": {
+    "sha256": "ce8aab1465054cb752bee19408c451e34b76cf201ddc8884e7e3f9c75b91a3ba"
+  },
+  "LICENSE-Wine-LGPL-2.1.txt": {
+    "sha256": "9f3f04d139eb08ddc28cbf7276a2963ba44141016a077ce5f3748fee5b61d02f"
+  },
+  "LICENSE.txt": {
+    "sha256": "2eeb20b65c5b10830eed2767d08a0656faf07dc3ae5cbda9d8c7928a39a66658"
+  }
+}

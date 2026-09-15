@@ -8,7 +8,7 @@ four-channel motion stream with nonzero samples on both haptic channels.
 
 ## Download and run
 
-1. Download **[ds2-fix-haptics.py from Releases](https://github.com/hamsarmo/DS2-Dualsense-Haptics-Wine/releases/latest)**.
+1. Download **[ds2-fix-haptics.py](https://github.com/hamsarmo/DS2-Dualsense-Haptics-Wine/raw/refs/heads/main/release/ds2-fix-haptics.py)**.
 2. Connect **one standard DualSense by USB**. Close DS2 and other Windows programs
    in its CrossOver bottle.
 3. Run this in Terminal (Python 3 required):
@@ -122,7 +122,7 @@ or override change makes automatic recovery ambiguous.
 
 The source launcher is `scripts/ds2-fix-haptics.py`; the Windows helper source is
 `src/controller-probe.c`. For development and source builds, see
-[BUILDING.md](docs/BUILDING.md). Release files have a `SHA256SUMS` manifest.
+[BUILDING.md](docs/BUILDING.md). Download files and the `SHA256SUMS` manifest are in [release/](release/).
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -136,7 +136,7 @@ The standalone release script also passed a real bottle preflight.
 
 Launcher, helper and scripts: [MIT](LICENSE). Wine patch and DLL:
 [LGPL-2.1-or-later](docs/LICENSE-Wine-LGPL-2.1.txt).
-The release includes the corresponding CodeWeavers source archive, the patch,
+The download directory includes the corresponding Wine source from CodeWeavers, the patch is in this repository,
 and build instructions. Sony/game binaries and gameplay recordings are excluded.
 
 This is a community workaround, not an official Sony, Kojima, Audiokinetic or

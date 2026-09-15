@@ -8,14 +8,17 @@ archive, not a different upstream Wine release. The archive's Wine version is
 archive itself does not carry the build serial; runtime compatibility was
 verified with that installed build.
 
-The release supplies `crossover-sources-26.3.0.tar.gz` as corresponding source:
+The download directory supplies `wine-crossover-26.3.0-source.tar.gz` as
+corresponding source. This is the complete, unmodified `sources/wine/` subtree
+extracted from the original CodeWeavers archive (unrelated projects omitted).
+Our patch is supplied separately in this repository. Original archive provenance:
 
 - Original URL: https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.3.0.tar.gz
 - SHA-256: `ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872`
 - Wine modification: `patches/0001-mmdevapi-return-ContainerId-as-VT_CLSID.patch`.
 - LGPL text: `LICENSE-Wine-LGPL-2.1.txt` alongside this document.
 
-The original archive, our patch and build scripts form the corresponding source
+The Wine source archive, our patch and build scripts form the corresponding source
 for the Wine-derived binary. Sony's SDK DLL is loaded from the user's installation
 and is never packaged. Our helper source and MIT license are in this repository.
 
