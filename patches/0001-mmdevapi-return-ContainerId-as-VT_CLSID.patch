@@ -1,0 +1,39 @@
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -288,6 +288,36 @@
+     {
+         case REG_SZ:
+         {
++            /* Properties whose Windows type is DEVPROP_TYPE_GUID must come back
++             * as VT_CLSID, not VT_LPWSTR.  Applications that read them -- Sony's
++             * libScePad, used by the PC ports of Death Stranding, Pragmata and
++             * others, to bind a DualSense HID device to its USB-audio endpoint --
++             * take PROPVARIANT.puuid directly, so handing them a string pointer
++             * silently yields a garbage GUID and the match never succeeds. */
++            if (IsEqualPropertyKey(*key, *(const PROPERTYKEY *)&DEVPKEY_Device_ContainerId))
++            {
++                WCHAR guidstr[39];
++                DWORD guidsize = sizeof(guidstr);
++                GUID *guid;
++
++                if (RegGetValueW(regkey, NULL, buffer, RRF_RT_REG_SZ, NULL,
++                                 (BYTE *)guidstr, &guidsize) == ERROR_SUCCESS)
++                {
++                    if (!(guid = CoTaskMemAlloc(sizeof(*guid))))
++                    {
++                        hr = E_OUTOFMEMORY;
++                        break;
++                    }
++                    if (SUCCEEDED(CLSIDFromString(guidstr, guid)))
++                    {
++                        pv->vt = VT_CLSID;
++                        pv->puuid = guid;
++                        break;
++                    }
++                    CoTaskMemFree(guid);
++                }
++            }
++
+             pv->vt = VT_LPWSTR;
+             pv->pwszVal = CoTaskMemAlloc(size);
+             if (!pv->pwszVal)
