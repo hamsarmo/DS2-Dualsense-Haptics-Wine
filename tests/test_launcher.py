@@ -83,6 +83,51 @@ class Tests(unittest.TestCase):
     def test_wrong_identity_restores(self):self.exercise('verify')
     def test_existing_property_is_preserved(self):self.exercise(existing=True)
 
+    def test_normal_install_refreshes_changed_controller_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); bottle=root/'bottle'; cx=root/'cx'; state=bottle/'.ds2-haptics'; assets=root/'assets'
+            dll=bottle/'drive_c/windows/system32/mmdevapi.dll'; stock=cx/'lib/wine/x86_64-windows/mmdevapi.dll'
+            for p in (dll,stock):p.parent.mkdir(parents=True);p.write_bytes(b'stock')
+            state.mkdir();assets.mkdir();(assets/'mmdevapi.dll').write_bytes(b'patch')
+            old='{0CE6054C-0000-FFFF-8AF9-BD7600000000}'
+            new='{0CE6054C-0000-FFFF-3C0D-0AE501000000}'
+            key=f'{m.MMDEV}\\Render\\{END}\\Properties'
+            override=r'HKCU\Software\Wine\AppDefaults\DS2.exe\DllOverrides'
+            (state/'mmdevapi.original.dll').write_bytes(b'stock')
+            (state/'state.json').write_text(json.dumps({
+                'bottle':str(bottle), 'original_sha256':m.sha(dll), 'keys':[key],
+                'override_key':override, 'sony_id':old, 'mode':'installed'}))
+            dll.write_bytes(b'patch')
+            fix=m.Fix(bottle,cx,state); registry={key:old, override:'native,builtin'}
+            def run(args, **kwargs):
+                if args[0].endswith('controller-probe.exe'):
+                    if args[1]=='-':
+                        return 0,f'ENDPOINT=Render|{END}|72|{new}\n'
+                    return 0,f'SONY_ID={new}\nENDPOINT=Render|{END}|0|\n'
+                op,k=args[1:3]
+                if op=='query':return (0 if k in registry else 1),'REG_SZ    '+registry.get(k,'')
+                if op=='add':registry[k]=args[args.index('/d')+1]
+                if op=='delete':registry.pop(k,None)
+                return 0,''
+            with patch.object(m,'STOCK_SHA',m.sha(stock)), patch.object(m,'PATCH_SHA',m.sha(assets/'mmdevapi.dll')), \
+                 patch.object(fix,'run',side_effect=run), patch.object(fix,'start'), patch.object(fix,'keeper') as keeper:
+                keeper.poll.return_value=None
+                fix.launch(root/'Sony.dll',root/'DS2.exe',assets,False,permanent=True,refresh=True)
+            saved=json.loads((state/'state.json').read_text())
+            self.assertEqual(saved['sony_id'],new)
+            self.assertEqual(registry[key],new)
+            self.assertEqual(registry[override],'native,builtin')
+            self.assertEqual(dll.read_bytes(),b'patch')
+
+    def test_check_reports_changed_identity_without_refreshing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); state=root/'state'; state.mkdir(); fix=m.Fix(root,root,state)
+            with patch.object(m,'sha',return_value='patch'), patch.object(m,'STOCK_SHA','patch'), \
+                 patch.object(fix,'verify_installed',side_effect=m.ControllerIdentityChanged('changed')):
+                (state/'state.json').write_text('{}')
+                with self.assertRaises(m.ControllerIdentityChanged):
+                    fix.launch(root/'Sony.dll',root/'DS2.exe',root,True,permanent=True,refresh=False)
+
     def test_recovery_refuses_external_dll_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);state=root/'state';state.mkdir()

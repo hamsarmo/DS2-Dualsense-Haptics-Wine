@@ -24,6 +24,10 @@ GUID = r'\{[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}'
 EMBEDDED = {}  # Release builder inserts compressed, checksummed open-source binaries.
 
 
+class ControllerIdentityChanged(RuntimeError):
+    """The saved Sony identity no longer matches the connected controller."""
+
+
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -143,7 +147,8 @@ class Fix:
         ids, endpoints = parse_probe(output)
         expected = self.data['sony_id']
         if ids != [expected] or any(vt != 72 or cid != expected for _,_,vt,cid in endpoints):
-            raise RuntimeError('Controller identity or endpoints changed. Uninstall, then install again with the controller connected.')
+            raise ControllerIdentityChanged(
+                'Controller identity or endpoints changed. Run the installer again with the controller connected.')
         code, value = self.run(['reg','query',self.data['override_key'],'/v','mmdevapi'], check=False, native=False)
         if code or not re.search(r'REG_SZ\s+native,builtin', value):
             raise RuntimeError('The DS2 DLL override changed. See the saved installation state before repairing.')
@@ -206,12 +211,21 @@ class Fix:
         if self.log:
             self.log.close()
 
-    def launch(self, runtime, game, asset_dir, check_only, permanent=False):
+    def launch(self, runtime, game, asset_dir, check_only, permanent=False, refresh=False):
         if sha(self.cx / 'lib/wine/x86_64-windows/mmdevapi.dll') != STOCK_SHA:
             raise RuntimeError('Unsupported CrossOver DLL. This release is tested with CrossOver 26.3.0.39832 only.')
         if (self.state / 'state.json').exists() and permanent:
-            self.verify_installed(runtime, asset_dir)
-            return
+            try:
+                self.verify_installed(runtime, asset_dir)
+                return
+            except ControllerIdentityChanged:
+                if not refresh:
+                    raise
+                print('The controller identity changed. Refreshing the permanent DS2 mapping.', flush=True)
+                self.restore()
+                # verify_installed() opened a Wine session. Close it before the
+                # fresh install waits for the bottle and opens its own session.
+                self.stop()
         if sha(self.dll) != STOCK_SHA:
             raise RuntimeError('The bottle already has a modified mmdevapi.dll. Restore it before using this fix.')
         if sha(asset_dir / 'mmdevapi.dll') != PATCH_SHA:
@@ -320,7 +334,8 @@ def main(argv=None):
             game = select_path([args.game.expanduser()] if args.game else
                                list((bottle / 'drive_c').glob('Program Files*/**/DS2.exe')),
                                'game executable', '--game /path/to/DS2.exe')
-            fix.launch(runtime, game, assets(), args.check, permanent=not args.session)
+            fix.launch(runtime, game, assets(), args.check, permanent=not args.session,
+                       refresh=not args.check and not args.session)
         finally:
             fix.stop()
 

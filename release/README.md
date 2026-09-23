@@ -1,7 +1,9 @@
-# v1.0.0 downloads
+# v1.0.1 downloads
 
 Download **[ds2-fix-haptics.py](https://github.com/hamsarmo/DS2-Dualsense-Haptics-Wine/raw/refs/heads/main/release/ds2-fix-haptics.py)** and run it with Python 3.
 See the [main README](../README.md) for supported versions, permanent/session modes and uninstall.
+Rerunning the normal command also refreshes a changed Wine controller identity;
+`--check` reports that condition without modifying the bottle.
 
 Only the Python file is needed to use the fix. It embeds the helper, Wine DLL and licenses.
 The other files are for verification, licensing and rebuilding:

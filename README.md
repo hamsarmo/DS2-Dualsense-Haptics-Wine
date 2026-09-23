@@ -34,8 +34,8 @@ checksums, and uses Sony's runtime already installed by your game.
 
 | Command | Behavior |
 |---|---|
-| no mode flag | Install once; leave the fix installed |
-| `--check` | Verify an existing installation; on a clean bottle, temporarily apply and verify, then restore without starting the game |
+| no mode flag | Install once; leave the fix installed. If Wine assigned a new Sony controller identity, safely refresh the saved mapping first. |
+| `--check` | Verify an existing installation without changing it; on a clean bottle, temporarily apply and verify, then restore without starting the game |
 | `--session` | Apply, launch DS2, and restore when the game exits; use on a clean bottle |
 | `--uninstall` | Restore the backed-up DLL and remove the properties/override added by this script |
 
@@ -108,10 +108,12 @@ that independently force native mmdevapi could also load the patched DLL. This
 is not a blanket guarantee for every program: keep unrelated apps in separate
 bottles, or use temporary mode if you want the bottle restored between runs.
 
-Sony's identity stayed stable across the tested sessions. It may change with a
-new controller, runtime, Wine or CrossOver update. If haptics stop, run `--check`.
-Uninstall and reinstall after changing controllers; uninstall before updating
-CrossOver. Keep the same USB connection during installation/gameplay.
+Wine can assign a new Sony identity after a USB reconnect, macOS restart, or
+controller/runtime update. If that happens, rerun the normal installer command
+with the controller connected; it verifies the existing installation, removes
+only its previous mapping, and installs a verified mapping for the current
+identity. `--check` remains read-only and reports the mismatch. Uninstall before
+updating CrossOver. Keep the same USB connection during installation/gameplay.
 
 The installer refuses multiple candidate endpoints, existing ContainerId values,
 an existing DS2 mmdevapi override, or an unfamiliar DLL rather than overwrite
