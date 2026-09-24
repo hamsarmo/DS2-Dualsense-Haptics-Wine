@@ -24,6 +24,18 @@ custom location or multiple installations, supply the **full bottle folder**:
 python3 ~/Downloads/ds2-fix-haptics.py --bottle "/path/to/CrossOver/Bottles/DS2"
 ```
 
+### What the script discovers
+
+The script does **not** contain a user name, drive name, bottle name, controller
+identity, or audio-endpoint ID from the tested installation. It automatically
+finds a single DS2 bottle in CrossOver's default Bottles folder, DS2.exe inside
+that bottle, the installed PlayStation PC SDK runtime, and the connected
+controller's current Sony identity and audio endpoints.
+
+Supply `--bottle` when your bottle is on another drive or CrossOver finds more
+than one DS2 installation. Supply `--game`, `--runtime`, or `--crossover` only
+when automatic discovery is ambiguous or you use a nonstandard location.
+
 For a bottle on an external drive, run the command from Terminal as shown.
 macOS may require granting Terminal access to **Removable Volumes** in Privacy
 & Security. A custom Finder app wrapper can be denied access to the same bottle
@@ -90,7 +102,7 @@ that copied the Windows HID property to the audio endpoint did not work.
 The successful combination:
 
 1. Query the identity returned by **Sony's runtime**, without substituting the
-   Windows HID value or hardcoding the author's controller identity.
+   Windows HID value or hardcoding a controller identity.
 2. Assign that identity to the connected controller's audio endpoints.
 3. Load a small Wine `mmdevapi` patch that returns this property as `VT_CLSID`,
    the Windows GUID property type.
