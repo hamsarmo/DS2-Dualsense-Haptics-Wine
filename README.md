@@ -24,6 +24,12 @@ custom location or multiple installations, supply the **full bottle folder**:
 python3 ~/Downloads/ds2-fix-haptics.py --bottle "/path/to/CrossOver/Bottles/DS2"
 ```
 
+For a bottle on an external drive, run the command from Terminal as shown.
+macOS may require granting Terminal access to **Removable Volumes** in Privacy
+& Security. A custom Finder app wrapper can be denied access to the same bottle
+even when the command works in Terminal; this release intentionally provides a
+Terminal command rather than a Finder launcher.
+
 It installs the fix permanently. **Launch DS2 normally afterward.** There is no
 need to run the script before each game. Keep the script to check or uninstall.
 The download contains the helper and patched Wine DLL; **no compiler or Python

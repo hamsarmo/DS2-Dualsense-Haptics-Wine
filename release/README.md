@@ -4,6 +4,8 @@ Download **[ds2-fix-haptics.py](https://github.com/hamsarmo/DS2-Dualsense-Haptic
 See the [main README](../README.md) for supported versions, permanent/session modes and uninstall.
 Rerunning the normal command also refreshes a changed Wine controller identity;
 `--check` reports that condition without modifying the bottle.
+For external bottles, run it from Terminal and allow Terminal access to
+Removable Volumes if macOS requests it.
 
 Only the Python file is needed to use the fix. It embeds the helper, Wine DLL and licenses.
 The other files are for verification, licensing and rebuilding:
